@@ -10,6 +10,21 @@ const CROWD_B := 1
 
 const EPSILON := 0.00001
 
+const PERSONALITY_AGGRESSIVE := 0
+const PERSONALITY_NEUTRAL := 1
+const PERSONALITY_PASSIVE := 2
+
+# Per-personality multipliers applied on top of the global tuning knobs.
+# Aggressive agents largely ignore RVO's safe-velocity correction (low
+# rvo_compliance), so they hold course while neutral/passive agents route
+# around them. Tint is the lerp amount toward black (-) or white (+) used
+# for per-instance albedo.
+const PERSONALITY_PROFILES := [
+	{ "time_horizon_mul": 0.35, "padding_mul": 0.4, "max_lateral_mul": 0.30, "speed_mul": 1.15, "rvo_compliance": 0.20, "tint": -0.30 },
+	{ "time_horizon_mul": 1.00, "padding_mul": 1.0, "max_lateral_mul": 1.00, "speed_mul": 1.00, "rvo_compliance": 1.00, "tint":  0.00 },
+	{ "time_horizon_mul": 1.60, "padding_mul": 1.4, "max_lateral_mul": 1.60, "speed_mul": 0.90, "rvo_compliance": 1.00, "tint":  0.30 },
+]
+
 @export_group("Simulation")
 @export_range(10, 10000, 10) var agent_count: int = 100
 @export_range(1, 100000, 1) var simulation_seed: int = 42
@@ -35,6 +50,11 @@ const EPSILON := 0.00001
 @export_range(0.0, 0.5, 0.01) var offside_destination_chance: float = 0.08
 @export_range(0.0, 4.0, 0.1) var offside_destination_extra: float = 1.4
 @export_range(0.4, 2.0, 0.05) var spawn_spacing: float = 0.85
+
+@export_group("Personalities")
+@export_range(0, 100, 1) var aggressive_percent: int = 0
+@export_range(0, 100, 1) var neutral_percent: int = 100
+@export_range(0, 100, 1) var passive_percent: int = 0
 
 @export_group("Avoidance (RVO)")
 @export_range(1.0, 20.0, 0.5) var rvo_neighbor_distance: float = 5.0
@@ -66,6 +86,9 @@ var preferred_speeds := PackedFloat32Array()
 var handedness := PackedFloat32Array()
 var crowd_ids := PackedInt32Array()
 var active := PackedByteArray()
+var personalities := PackedInt32Array()
+var personal_max_lateral := PackedFloat32Array()
+var rvo_compliance := PackedFloat32Array()
 var agent_rids: Array[RID] = []
 var _position_corrections := PackedVector2Array()
 
@@ -79,6 +102,8 @@ var _arrived_count := 0
 var _crowd_a_count := 0
 var _crowd_b_count := 0
 var _last_simulation_ms := 0.0
+var _walk_elapsed := 0.0
+var _walk_final_seconds := 0.0
 
 var _camera: Camera3D
 var _camera_target := Vector3.ZERO
@@ -92,6 +117,15 @@ var _crowd_b_mesh: MultiMeshInstance3D
 var _debug_label: Label
 var _stop_material: StandardMaterial3D
 var _walk_material: StandardMaterial3D
+var _crowd_a_base_color := Color(0.11, 0.36, 0.95)
+var _crowd_b_base_color := Color(0.88, 0.25, 0.17)
+var _aggressive_slider: HSlider
+var _neutral_slider: HSlider
+var _passive_slider: HSlider
+var _aggressive_value_label: Label
+var _neutral_value_label: Label
+var _passive_value_label: Label
+var _suppress_slider_callbacks := false
 
 
 func _ready() -> void:
@@ -132,6 +166,8 @@ func _physics_process(delta: float) -> void:
 	if _state != STATE_WALKING:
 		return
 
+	_walk_elapsed += delta
+
 	var frame_start_usec := Time.get_ticks_usec()
 
 	# Belt-and-suspenders: clean up any residual overlaps from the previous
@@ -165,6 +201,7 @@ func _physics_process(delta: float) -> void:
 
 	if _arrived_count >= agent_count:
 		_state = STATE_DONE
+		_walk_final_seconds = _walk_elapsed
 
 
 func _on_avoidance(safe_velocity: Vector3, agent_index: int) -> void:
@@ -178,6 +215,12 @@ func _on_avoidance(safe_velocity: Vector3, agent_index: int) -> void:
 
 	var safe_2d := Vector2(safe_velocity.x, safe_velocity.z)
 
+	# Aggressive agents (low compliance) mostly use their preferred velocity
+	# and ignore RVO's deviation; RVO still treats them as moving obstacles
+	# so neutral/passive agents route around them.
+	var preferred_2d := desired_dirs[agent_index] * preferred_speeds[agent_index]
+	safe_2d = preferred_2d.lerp(safe_2d, rvo_compliance[agent_index])
+
 	# Decompose into goal-relative forward and lateral components.
 	# Real humans walk forward; sidestepping is slow and effortful. RVO is
 	# happy to pick large lateral velocities when forward is blocked, which
@@ -187,8 +230,9 @@ func _on_avoidance(safe_velocity: Vector3, agent_index: int) -> void:
 	var raw_forward := safe_2d.dot(goal_dir)
 	var forward_speed := maxf(raw_forward, 0.0)
 	var lateral := safe_2d - goal_dir * raw_forward
-	if lateral.length_squared() > max_lateral_speed * max_lateral_speed:
-		lateral = lateral.normalized() * max_lateral_speed
+	var lateral_cap := personal_max_lateral[agent_index]
+	if lateral.length_squared() > lateral_cap * lateral_cap:
+		lateral = lateral.normalized() * lateral_cap
 	safe_2d = goal_dir * forward_speed + lateral
 
 	velocities[agent_index] = safe_2d
@@ -316,6 +360,8 @@ func reset_simulation() -> void:
 	_free_agent_rids()
 	_rng.seed = simulation_seed
 	_elapsed = 0.0
+	_walk_elapsed = 0.0
+	_walk_final_seconds = 0.0
 	_state = STATE_WAITING
 	_arrived_count = 0
 	_crowd_a_count = int(agent_count / 2)
@@ -425,6 +471,9 @@ func _resize_agent_arrays(size: int) -> void:
 	handedness.resize(size)
 	crowd_ids.resize(size)
 	active.resize(size)
+	personalities.resize(size)
+	personal_max_lateral.resize(size)
+	rvo_compliance.resize(size)
 	agent_rids.resize(size)
 
 
@@ -436,6 +485,7 @@ func _spawn_crowd(crowd_id: int, start_index: int, count: int) -> void:
 	var start_edge_z := -crossing_length * 0.5 - curb_buffer if crowd_id == CROWD_A else crossing_length * 0.5 + curb_buffer
 	var destination_z := crossing_length * 0.5 + sidewalk_depth * 0.55 if crowd_id == CROWD_A else -crossing_length * 0.5 - sidewalk_depth * 0.55
 	var center_offset := float(columns - 1) * spawn_spacing * 0.5
+	var bag := _make_personality_bag(count)
 
 	for local_index in range(count):
 		var agent_index := start_index + local_index
@@ -450,30 +500,39 @@ func _spawn_crowd(crowd_id: int, start_index: int, count: int) -> void:
 		)
 		var z := start_edge_z - direction_z * float(row) * spawn_spacing + z_jitter
 		var destination_x := _destination_x_for_start(x, destination_half_width)
+		var personality := bag[local_index]
+		var profile: Dictionary = PERSONALITY_PROFILES[personality]
+		var speed_mul := float(profile["speed_mul"])
+		var lateral_mul := float(profile["max_lateral_mul"])
+		var padding_mul := float(profile["padding_mul"])
+		var horizon_mul := float(profile["time_horizon_mul"])
 
 		positions[agent_index] = Vector2(x, z)
 		velocities[agent_index] = Vector2.ZERO
 		destinations[agent_index] = Vector2(destination_x, destination_z)
 		desired_dirs[agent_index] = Vector2(destination_x - x, destination_z - z).normalized()
 		radii[agent_index] = body_radius * _rng.randf_range(0.92, 1.08)
-		preferred_speeds[agent_index] = _rng.randf_range(min_speed, max_speed)
+		preferred_speeds[agent_index] = _rng.randf_range(min_speed, max_speed) * speed_mul
 		handedness[agent_index] = -1.0 if _rng.randf() < right_pass_probability else 1.0
 		start_delay[agent_index] = _rng.randf_range(0.0, max_start_delay)
 		crowd_ids[agent_index] = crowd_id
 		active[agent_index] = 1
+		personalities[agent_index] = personality
+		personal_max_lateral[agent_index] = max_lateral_speed * lateral_mul
+		rvo_compliance[agent_index] = float(profile["rvo_compliance"])
 
 		var rid := NavigationServer3D.agent_create()
 		agent_rids[agent_index] = rid
 		NavigationServer3D.agent_set_map(rid, _navigation_map)
 		NavigationServer3D.agent_set_avoidance_enabled(rid, true)
 		NavigationServer3D.agent_set_use_3d_avoidance(rid, false)
-		NavigationServer3D.agent_set_radius(rid, radii[agent_index] + collision_padding * 0.5)
+		NavigationServer3D.agent_set_radius(rid, radii[agent_index] + collision_padding * 0.5 * padding_mul)
 		NavigationServer3D.agent_set_height(rid, capsule_height)
 		NavigationServer3D.agent_set_max_speed(rid, max_speed + 0.5)
 		NavigationServer3D.agent_set_neighbor_distance(rid, rvo_neighbor_distance)
 		NavigationServer3D.agent_set_max_neighbors(rid, rvo_max_neighbors)
-		NavigationServer3D.agent_set_time_horizon_agents(rid, rvo_time_horizon)
-		NavigationServer3D.agent_set_time_horizon_obstacles(rid, rvo_time_horizon)
+		NavigationServer3D.agent_set_time_horizon_agents(rid, rvo_time_horizon * horizon_mul)
+		NavigationServer3D.agent_set_time_horizon_obstacles(rid, rvo_time_horizon * horizon_mul)
 		NavigationServer3D.agent_set_position(rid, _to_3d(positions[agent_index]))
 		NavigationServer3D.agent_set_velocity_forced(rid, Vector3.ZERO)
 		NavigationServer3D.agent_set_avoidance_callback(rid, _on_avoidance.bind(agent_index))
@@ -569,6 +628,173 @@ func _build_debug_overlay() -> void:
 	_debug_label.add_theme_font_size_override("font_size", 16)
 	canvas.add_child(_debug_label)
 
+	_build_personality_panel(canvas)
+
+
+func _build_personality_panel(canvas: CanvasLayer) -> void:
+	var panel := PanelContainer.new()
+	panel.name = "PersonalityPanel"
+	canvas.add_child(panel)
+	panel.anchor_left = 0.0
+	panel.anchor_top = 1.0
+	panel.anchor_right = 0.0
+	panel.anchor_bottom = 1.0
+	panel.offset_left = 16.0
+	panel.offset_top = -184.0
+	panel.offset_right = 376.0
+	panel.offset_bottom = -16.0
+
+	var margin := MarginContainer.new()
+	margin.add_theme_constant_override("margin_left", 12)
+	margin.add_theme_constant_override("margin_right", 12)
+	margin.add_theme_constant_override("margin_top", 10)
+	margin.add_theme_constant_override("margin_bottom", 10)
+	panel.add_child(margin)
+
+	var vbox := VBoxContainer.new()
+	vbox.add_theme_constant_override("separation", 6)
+	margin.add_child(vbox)
+
+	var title := Label.new()
+	title.text = "Personality Mix"
+	title.add_theme_font_size_override("font_size", 14)
+	vbox.add_child(title)
+
+	_aggressive_slider = HSlider.new()
+	_aggressive_value_label = Label.new()
+	_build_personality_row(vbox, "Aggressive", _aggressive_slider, _aggressive_value_label, aggressive_percent, 0)
+
+	_neutral_slider = HSlider.new()
+	_neutral_value_label = Label.new()
+	_build_personality_row(vbox, "Neutral", _neutral_slider, _neutral_value_label, neutral_percent, 1)
+
+	_passive_slider = HSlider.new()
+	_passive_value_label = Label.new()
+	_build_personality_row(vbox, "Passive", _passive_slider, _passive_value_label, passive_percent, 2)
+
+
+func _build_personality_row(parent: Control, label_text: String, slider: HSlider, value_label: Label, initial: int, slider_index: int) -> void:
+	var row := HBoxContainer.new()
+	row.add_theme_constant_override("separation", 8)
+	parent.add_child(row)
+
+	var name_label := Label.new()
+	name_label.text = label_text
+	name_label.custom_minimum_size = Vector2(80, 0)
+	row.add_child(name_label)
+
+	slider.min_value = 0.0
+	slider.max_value = 100.0
+	slider.step = 1.0
+	slider.value = float(initial)
+	slider.custom_minimum_size = Vector2(180, 0)
+	slider.size_flags_horizontal = Control.SIZE_EXPAND_FILL
+	row.add_child(slider)
+
+	value_label.text = "%d%%" % initial
+	value_label.custom_minimum_size = Vector2(40, 0)
+	row.add_child(value_label)
+
+	slider.value_changed.connect(_on_personality_slider_changed.bind(slider_index))
+	slider.drag_ended.connect(_on_personality_drag_ended)
+
+
+func _on_personality_slider_changed(value: float, slider_index: int) -> void:
+	if _suppress_slider_callbacks:
+		return
+	_rebalance_sliders(slider_index, int(round(value)))
+
+
+func _on_personality_drag_ended(_value_changed: bool) -> void:
+	reset_simulation()
+
+
+func _rebalance_sliders(changed_index: int, new_value: int) -> void:
+	new_value = clampi(new_value, 0, 100)
+	var values := [aggressive_percent, neutral_percent, passive_percent]
+	values[changed_index] = new_value
+
+	var remainder := 100 - new_value
+	var other_a := (changed_index + 1) % 3
+	var other_b := (changed_index + 2) % 3
+	var other_sum: int = values[other_a] + values[other_b]
+
+	if other_sum > 0:
+		var scaled_a := int(round(float(values[other_a]) * float(remainder) / float(other_sum)))
+		scaled_a = clampi(scaled_a, 0, remainder)
+		values[other_a] = scaled_a
+		values[other_b] = remainder - scaled_a
+	else:
+		var half_a := remainder / 2
+		values[other_a] = half_a
+		values[other_b] = remainder - half_a
+
+	aggressive_percent = values[0]
+	neutral_percent = values[1]
+	passive_percent = values[2]
+
+	_suppress_slider_callbacks = true
+	_aggressive_slider.value = float(aggressive_percent)
+	_neutral_slider.value = float(neutral_percent)
+	_passive_slider.value = float(passive_percent)
+	_aggressive_value_label.text = "%d%%" % aggressive_percent
+	_neutral_value_label.text = "%d%%" % neutral_percent
+	_passive_value_label.text = "%d%%" % passive_percent
+	_suppress_slider_callbacks = false
+
+
+func _make_personality_bag(count: int) -> PackedInt32Array:
+	var bag := PackedInt32Array()
+	bag.resize(count)
+	if count <= 0:
+		return bag
+
+	var total := aggressive_percent + neutral_percent + passive_percent
+	if total <= 0:
+		for i in range(count):
+			bag[i] = PERSONALITY_NEUTRAL
+		return bag
+
+	var raw := [
+		float(aggressive_percent) / float(total) * float(count),
+		float(neutral_percent) / float(total) * float(count),
+		float(passive_percent) / float(total) * float(count),
+	]
+	var floors := [int(floor(raw[0])), int(floor(raw[1])), int(floor(raw[2]))]
+	var remainders := [raw[0] - floor(raw[0]), raw[1] - floor(raw[1]), raw[2] - floor(raw[2])]
+	var deficit: int = count - (floors[0] + floors[1] + floors[2])
+	while deficit > 0:
+		var best := 0
+		for i in range(1, 3):
+			if remainders[i] > remainders[best]:
+				best = i
+		floors[best] += 1
+		remainders[best] = -1.0
+		deficit -= 1
+
+	var idx := 0
+	var nonzero_personalities := 0
+	for personality in range(3):
+		var f: int = floors[personality]
+		if f > 0:
+			nonzero_personalities += 1
+		for _j in range(f):
+			bag[idx] = personality
+			idx += 1
+
+	# Only shuffle when the bag actually has more than one personality.
+	# A uniform bag is unchanged by shuffling but still consumes RNG state,
+	# which would shift downstream randf calls in _spawn_crowd and break
+	# behavior parity at the default 0/100/0 mix.
+	if nonzero_personalities > 1:
+		for i in range(count - 1, 0, -1):
+			var j := _rng.randi_range(0, i)
+			var tmp: int = bag[i]
+			bag[i] = bag[j]
+			bag[j] = tmp
+
+	return bag
+
 
 func _rebuild_agent_multimeshes() -> void:
 	if is_instance_valid(_crowd_a_mesh):
@@ -576,24 +802,27 @@ func _rebuild_agent_multimeshes() -> void:
 	if is_instance_valid(_crowd_b_mesh):
 		_crowd_b_mesh.queue_free()
 
-	_crowd_a_mesh = _make_agent_multimesh("CrowdA", _crowd_a_count, Color(0.11, 0.36, 0.95))
-	_crowd_b_mesh = _make_agent_multimesh("CrowdB", _crowd_b_count, Color(0.88, 0.25, 0.17))
+	_crowd_a_mesh = _make_agent_multimesh("CrowdA", _crowd_a_count)
+	_crowd_b_mesh = _make_agent_multimesh("CrowdB", _crowd_b_count)
 	add_child(_crowd_a_mesh)
 	add_child(_crowd_b_mesh)
+	_apply_instance_colors()
 
 
-func _make_agent_multimesh(node_name: String, count: int, color: Color) -> MultiMeshInstance3D:
+func _make_agent_multimesh(node_name: String, count: int) -> MultiMeshInstance3D:
 	var capsule := CapsuleMesh.new()
 	capsule.radius = body_radius
 	capsule.height = capsule_height
 	capsule.radial_segments = 10
 	capsule.rings = 4
 
-	var material := _make_material(color)
+	var material := _make_material(Color.WHITE)
 	material.roughness = 0.6
+	material.vertex_color_use_as_albedo = true
 
 	var multimesh := MultiMesh.new()
 	multimesh.transform_format = MultiMesh.TRANSFORM_3D
+	multimesh.use_colors = true
 	multimesh.mesh = capsule
 	multimesh.instance_count = count
 
@@ -602,6 +831,22 @@ func _make_agent_multimesh(node_name: String, count: int, color: Color) -> Multi
 	instance.material_override = material
 	instance.multimesh = multimesh
 	return instance
+
+
+func _apply_instance_colors() -> void:
+	if not is_instance_valid(_crowd_a_mesh) or not is_instance_valid(_crowd_b_mesh):
+		return
+
+	for i in range(agent_count):
+		var personality := personalities[i]
+		var tint := float(PERSONALITY_PROFILES[personality]["tint"])
+		var base_color: Color = _crowd_a_base_color if i < _crowd_a_count else _crowd_b_base_color
+		var target := Color.WHITE if tint > 0.0 else Color.BLACK
+		var blended := base_color.lerp(target, absf(tint))
+		if i < _crowd_a_count:
+			_crowd_a_mesh.multimesh.set_instance_color(i, blended)
+		else:
+			_crowd_b_mesh.multimesh.set_instance_color(i - _crowd_a_count, blended)
 
 
 func _update_agent_visuals() -> void:
@@ -628,10 +873,17 @@ func _update_debug_label() -> void:
 	elif _state == STATE_DONE:
 		state_text = "Done"
 
-	_debug_label.text = "State: %s\nAgents: %d\nCrossed: %d\nFPS: %d\nSim: %.2f ms" % [
+	var cross_text := "—"
+	if _state == STATE_WALKING:
+		cross_text = "%.2f s" % _walk_elapsed
+	elif _state == STATE_DONE:
+		cross_text = "%.2f s (final)" % _walk_final_seconds
+
+	_debug_label.text = "State: %s\nAgents: %d\nCrossed: %d\nCross time: %s\nFPS: %d\nSim: %.2f ms" % [
 		state_text,
 		agent_count,
 		_arrived_count,
+		cross_text,
 		Engine.get_frames_per_second(),
 		_last_simulation_ms
 	]

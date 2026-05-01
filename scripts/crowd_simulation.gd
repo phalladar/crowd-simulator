@@ -1,6 +1,16 @@
 extends Node3D
 class_name CrowdSimulation
 
+# When set true by an orchestrator (e.g. tournament.gd) the node skips
+# building its own camera, lighting, world environment, debug overlay,
+# slider HUD, batch parsing, and input handling. The street/agents/RVO
+# still build normally so a tile renders correctly when its parent
+# transform offsets it within a grid scene.
+@export var embedded_in_grid: bool = false
+@export var tile_label: String = ""
+
+signal run_completed(cross_time: float, arrived: int)
+
 const STATE_WAITING := 0
 const STATE_WALKING := 1
 const STATE_DONE := 2
@@ -105,6 +115,16 @@ var _last_simulation_ms := 0.0
 var _walk_elapsed := 0.0
 var _walk_final_seconds := 0.0
 
+var _batch_mode := false
+var _batch_configs: Array = []
+var _batch_index := 0
+var _batch_results: Array = []
+var _batch_timeout_seconds := 30.0
+var _batch_output_path := "res://batch_results.csv"
+var _batch_run_started_msec := 0
+var _batch_started_msec := 0
+var _batch_seed_count := 100
+
 var _camera: Camera3D
 var _camera_target := Vector3.ZERO
 var _camera_yaw := 0.0
@@ -126,13 +146,19 @@ var _aggressive_value_label: Label
 var _neutral_value_label: Label
 var _passive_value_label: Label
 var _suppress_slider_callbacks := false
+var _tile_label_3d: Label3D
 
 
 func _ready() -> void:
+	if not embedded_in_grid:
+		_parse_batch_args()
 	_rng.seed = simulation_seed
 	_setup_navigation_map()
 	_build_world()
-	reset_simulation()
+	if _batch_mode and not embedded_in_grid:
+		_start_batch()
+	else:
+		reset_simulation()
 
 
 func _exit_tree() -> void:
@@ -150,6 +176,18 @@ func _setup_navigation_map() -> void:
 func _process(_delta: float) -> void:
 	_update_agent_visuals()
 	_update_debug_label()
+	_update_tile_label()
+
+
+func _update_tile_label() -> void:
+	if not is_instance_valid(_tile_label_3d):
+		return
+	var time_text := "—"
+	if _state == STATE_WALKING:
+		time_text = "%.1fs · %d/%d" % [_walk_elapsed, _arrived_count, agent_count]
+	elif _state == STATE_DONE:
+		time_text = "%.2fs · DONE" % _walk_final_seconds
+	_tile_label_3d.text = "%s\n%s" % [tile_label, time_text]
 
 
 func _physics_process(delta: float) -> void:
@@ -202,6 +240,16 @@ func _physics_process(delta: float) -> void:
 	if _arrived_count >= agent_count:
 		_state = STATE_DONE
 		_walk_final_seconds = _walk_elapsed
+		if _batch_mode:
+			_record_batch_result(false)
+		else:
+			run_completed.emit(_walk_final_seconds, _arrived_count)
+		return
+
+	if _batch_mode and _walk_elapsed > _batch_timeout_seconds:
+		_state = STATE_DONE
+		_walk_final_seconds = _walk_elapsed
+		_record_batch_result(true)
 
 
 func _on_avoidance(safe_velocity: Vector3, agent_index: int) -> void:
@@ -370,8 +418,9 @@ func reset_simulation() -> void:
 	_resize_agent_arrays(agent_count)
 	_spawn_crowd(CROWD_A, 0, _crowd_a_count)
 	_spawn_crowd(CROWD_B, _crowd_a_count, _crowd_b_count)
-	_rebuild_agent_multimeshes()
-	_set_walk_signal(false)
+	if not _batch_mode:
+		_rebuild_agent_multimeshes()
+		_set_walk_signal(false)
 
 
 func _free_agent_rids() -> void:
@@ -539,10 +588,41 @@ func _spawn_crowd(crowd_id: int, start_index: int, count: int) -> void:
 
 
 func _build_world() -> void:
+	if _batch_mode:
+		# Headless: no meshes, no lighting, no camera, no UI. Navigation
+		# map is already set up; that's all the sim needs to step.
+		set_process(false)
+		set_process_unhandled_input(false)
+		return
+	if embedded_in_grid:
+		# Tile inside a tournament grid: street + agents + per-tile label,
+		# but no camera, no lighting, no world env, no input, no slider HUD.
+		# The orchestrator owns those at the scene level.
+		set_process_unhandled_input(false)
+		_build_environment_meshes()
+		_build_signal_lights()
+		_build_tile_label_3d()
+		return
 	_build_environment_meshes()
 	_build_signal_lights()
 	_build_camera_and_lighting()
 	_build_debug_overlay()
+
+
+func _build_tile_label_3d() -> void:
+	_tile_label_3d = Label3D.new()
+	_tile_label_3d.text = tile_label
+	_tile_label_3d.font_size = 96
+	_tile_label_3d.pixel_size = 0.025
+	# Sit above the south sidewalk (screen-up side relative to the iso
+	# camera), clear of the crosswalk where agents walk.
+	_tile_label_3d.position = Vector3(0.0, 3.5, -(crossing_length * 0.5 + sidewalk_depth * 0.5))
+	_tile_label_3d.billboard = BaseMaterial3D.BILLBOARD_ENABLED
+	_tile_label_3d.outline_size = 16
+	_tile_label_3d.modulate = Color(1, 1, 1)
+	_tile_label_3d.outline_modulate = Color(0, 0, 0)
+	_tile_label_3d.no_depth_test = true
+	add_child(_tile_label_3d)
 
 
 func _build_environment_meshes() -> void:
@@ -794,6 +874,126 @@ func _make_personality_bag(count: int) -> PackedInt32Array:
 			bag[j] = tmp
 
 	return bag
+
+
+func _parse_batch_args() -> void:
+	var args := OS.get_cmdline_user_args()
+	var i := 0
+	while i < args.size():
+		var arg: String = args[i]
+		match arg:
+			"--batch":
+				_batch_mode = true
+				i += 1
+			"--seeds":
+				_batch_seed_count = int(args[i + 1])
+				i += 2
+			"--timeout":
+				_batch_timeout_seconds = float(args[i + 1])
+				i += 2
+			"--out":
+				_batch_output_path = args[i + 1]
+				i += 2
+			"--agents":
+				agent_count = int(args[i + 1])
+				i += 2
+			_:
+				i += 1
+
+
+func _start_batch() -> void:
+	# Only skip the pre-walk countdown; preserve max_start_delay so agents
+	# stagger their entry as in the interactive sim. Zeroing it caused
+	# every run to jam (all 100 agents enter the crosswalk on the same tick).
+	auto_start_seconds = 0.0
+	if _batch_configs.is_empty():
+		_batch_configs = _default_batch_matrix()
+	_batch_index = 0
+	_batch_results.clear()
+	_batch_started_msec = Time.get_ticks_msec()
+	print("[batch] starting %d runs (timeout=%.1fs, agents=%d) -> %s" % [
+		_batch_configs.size(), _batch_timeout_seconds, agent_count, _batch_output_path
+	])
+	_start_next_batch_run()
+
+
+func _default_batch_matrix() -> Array:
+	var slider_configs := [
+		[0, 100, 0],
+		[100, 0, 0],
+		[0, 0, 100],
+		[50, 50, 0],
+		[50, 0, 50],
+		[0, 50, 50],
+		[33, 34, 33],
+	]
+	var matrix: Array = []
+	for cfg in slider_configs:
+		for s in range(_batch_seed_count):
+			matrix.append({
+				"aggressive": cfg[0],
+				"neutral": cfg[1],
+				"passive": cfg[2],
+				"seed": 1 + s,
+				"agents": agent_count,
+			})
+	return matrix
+
+
+func _start_next_batch_run() -> void:
+	if _batch_index >= _batch_configs.size():
+		_finish_batch()
+		return
+	var cfg: Dictionary = _batch_configs[_batch_index]
+	aggressive_percent = int(cfg["aggressive"])
+	neutral_percent = int(cfg["neutral"])
+	passive_percent = int(cfg["passive"])
+	simulation_seed = int(cfg["seed"])
+	agent_count = int(cfg["agents"])
+	_batch_run_started_msec = Time.get_ticks_msec()
+	reset_simulation()
+
+
+func _record_batch_result(timed_out: bool) -> void:
+	var cfg: Dictionary = _batch_configs[_batch_index]
+	var wall_msec := Time.get_ticks_msec() - _batch_run_started_msec
+	_batch_results.append({
+		"aggressive": cfg["aggressive"],
+		"neutral": cfg["neutral"],
+		"passive": cfg["passive"],
+		"seed": cfg["seed"],
+		"agents": cfg["agents"],
+		"cross_time": _walk_final_seconds,
+		"arrived": _arrived_count,
+		"timed_out": timed_out,
+		"wall_msec": wall_msec,
+	})
+	_batch_index += 1
+	if _batch_index % 10 == 0 or _batch_index == _batch_configs.size():
+		var total_wall := (Time.get_ticks_msec() - _batch_started_msec) / 1000.0
+		print("[batch] %d / %d runs done (%.1fs wall)" % [_batch_index, _batch_configs.size(), total_wall])
+	_start_next_batch_run()
+
+
+func _finish_batch() -> void:
+	_write_batch_csv()
+	var total_wall := (Time.get_ticks_msec() - _batch_started_msec) / 1000.0
+	print("[batch] wrote %d results to %s in %.1fs" % [_batch_results.size(), _batch_output_path, total_wall])
+	get_tree().quit()
+
+
+func _write_batch_csv() -> void:
+	var f := FileAccess.open(_batch_output_path, FileAccess.WRITE)
+	if f == null:
+		push_error("Could not open %s for writing (error=%d)" % [_batch_output_path, FileAccess.get_open_error()])
+		return
+	f.store_line("aggressive,neutral,passive,seed,agents,cross_time,arrived,timed_out,wall_msec")
+	for r in _batch_results:
+		f.store_line("%d,%d,%d,%d,%d,%.4f,%d,%s,%d" % [
+			r["aggressive"], r["neutral"], r["passive"], r["seed"], r["agents"],
+			r["cross_time"], r["arrived"], "true" if r["timed_out"] else "false", r["wall_msec"]
+		])
+	f.close()
 
 
 func _rebuild_agent_multimeshes() -> void:

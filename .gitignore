@@ -61,9 +61,14 @@ $RECYCLE.BIN/
 *.swo
 *~
 
-# Claude Code (per-user local settings)
-.claude/settings.local.json
+# Claude Code (per-user local settings, scheduled-task locks, etc.)
+.claude/
 
 # Logs
 *.log
 logs/
+
+# Batch / Monte Carlo output
+batch_results*.csv
+batch_output/
+batch_*_log.txt
